@@ -20,7 +20,7 @@
 
 本地公开布局结果不等同于服务器隐藏实例成绩。
 
-## 2. 最终算法
+## 2. 第一阶段算法基础
 
 ### 2.1 多 Agent Alpha-Beta
 
@@ -71,7 +71,7 @@ min(0.35 秒, 剩余内部预算 / max(12, ceil(1.5 × 剩余食物数)))
 | V1 边界检查 | 在 `mediumClassic2` 读取 Agent 内部计时 | 24.008375 秒，超过目标约 8 毫秒 | 必须硬化预算 |
 | V2 | 排序改为只看 score、终局和 ghost 距离的廉价键 | contest 得分仍为 2274，耗时 2.978→2.124 秒；但 medium2 得分 1420→21 | 得分严重退化，撤销 |
 | V3 | 恢复完整排序；O(1) fallback；保护余量 0.25 秒 | evaluator 7/12 胜；总分 14005；平均 1167.08；medium2 内部计时 23.519567 秒 | 预算安全但过于保守 |
-| V4（最终） | 将保护余量收紧到 0.05 秒 | evaluator 7/12 胜；总分 15386；平均 1282.17；medium2 内部计时 23.718205 秒 | 总分最高且低于 24 秒 |
+| V4（第一阶段提交版本） | 将保护余量收紧到 0.05 秒 | evaluator 7/12 胜；总分 15386；平均 1282.17；medium2 内部计时 23.718205 秒 | 作为第二阶段优化基线 |
 
 V2 表明“更快完成更深 minimax”不一定提高实际分数。评分环境中的 ghost 是随机控制，但搜索规范要求把 ghost 当 minimiser；更深的最坏情况策略可能对实际随机轨迹过于保守。完整评估排序虽然更贵，却在公开地图上形成了更好的搜索截止位置和实际策略。
 
@@ -90,7 +90,7 @@ V3 到 V4 的比较表明，保护余量过大也会改变可完成的迭代层�
 
 在该图上，更深搜索持续提高分数；仅使用 GUI score 的评估函数会忽略局部食物、胶囊和 ghost 风险，最终死亡。综合评估函数是主要增益来源。
 
-## 5. 最终 12 图结果
+## 5. 第一阶段 12 图结果
 
 最终命令运行总耗时约 2 分 1 秒，退出码为 0；没有出现 timeout、crash、Traceback 或未捕获异常。
 
@@ -153,3 +153,112 @@ uvx --from ruff ruff check agents/q2Agent.py
 ```
 
 运行 evaluator 时，在确认提示中输入 `y`。
+
+## 8. 第二阶段：成功率优化
+
+第二阶段采用双轨验证：一组严格使用课程 -f 固定 seed；另一组在同一 12 张地图上使用预先确定的多个 seed。所有候选均保持 getAction(gameState) 接口不变，不修改地图、ghost 或模拟器。
+
+### 8.1 原始多 seed 基线
+
+第一阶段代码在 seeds 0、1、2 的 36 局 paired 基线为：
+
+- 17/36 胜，胜率 47.22%。
+- 平均分 849.75。
+- 0 timeout、0 error。
+
+### 8.2 候选消融
+
+| 候选 | 关键证据 | 决策 |
+|:--|:--|:--|
+| 等价 ghost 排序 + evaluation cache | 固定均分 1224.58→1332.00；多 seed 17→18 胜；运行时间下降 | 保留 |
+| 生成后继缓存 | 复用迭代加深中的同一状态后继，不改变状态值 | 保留 |
+| 削减深搜索预算换 strong fallback | medium2 固定 1994→1415 | 撤销 |
+| 全局 maze distance | contest、danger、medium2、open 均明显下降 | 撤销 |
+| dangerScale=2.0 | 15 局成功数不变，tricky 均分下降 | 撤销 |
+| 全局胶囊权重加倍 | capsule 2/5→4/5 胜，但 medium2 固定 1994→478 | 撤销 |
+| 情境胶囊权重 | capsule 没有净增胜局，且大图回归 | 撤销 |
+| 提前 endgame 权重 | open 出现 3258 回合循环并由胜转负 | 撤销 |
+| 纯 expectimax | trapped 转胜，但 medium/open 由胜转负 | 撤销 |
+| 全局 mean/min 混合 | ghostMeanWeight=0.25 仍丢 medium/open | 撤销 |
+| alpha-beta 必败门控 expectimax | trapped 固定 -501→532；20 seeds 获得 8 胜，普通状态不触发 | 保留 |
+| reactive fallback，不削减深搜索 | 固定 tricky 负→3040/胜；多 seed 大图均分提高 | 保留 |
+| 安全直走廊快捷规则 | 固定 original 转胜；多 seed 成功率显著提高 | 保留 |
+| cycle guard + 最少访问 fallback | open seed0 从超长失败变为完成清图 | 保留 |
+| 全局 depth 2 | 固定与多 seed 胜数未提高，固定均分下降 | 撤销 |
+| 每回合分支自适应深度 | 额外开销导致 open/original 固定转负 | 撤销 |
+| 每局初始化一次的分支阈值 | 高初始联合分支时使用 depth 2，无每回合开销 | 保留 |
+
+### 8.3 最终新增机制
+
+- **等价 ghost 排序**：同一 ghost node 的 food、capsule 和 Pac-Man 位置不变，因此只计算 score、terminal 和 ghost 风险。254 组真实 sibling 与完整排序一致。
+- **evaluation/successor cache**：每次 getAction 缓存状态评估和状态后继，减少 depth 1/2/3 重复工作。
+- **forced-loss expectimax**：正常动作始终由严格 alpha-beta 选择；只有完整 alpha-beta 已证明终局级必败时，才在同一已完成深度用均匀 ghost 期望寻找逃生机会。
+- **安全走廊快捷规则**：直走/反向且 active ghost 距离大于 6 时，先完成 depth1 alpha-beta 安全搜索；非终局级必败时才采用直走规则。scaredTimer≤1 按 active 处理。
+- **cycle guard**：记录自上次吃豆后的访问位置；重复或长期无进展时禁用走廊快捷，预算耗尽时选择较少访问的安全后继。
+- **reactive fallback**：深搜索预算耗尽后、总内部时间低于 27 秒时，每回合最多 3ms 枚举一步 ghost 回复。
+- **初始化复杂度深度**：仅在每局开始计算一次联合分支；超过 64 时最大深度为 2，否则保持 3。
+
+## 9. 当前最终官方 evaluator 结果
+
+发布安全版运行官方 evaluator，退出码 0，总耗时约 1 分 36 秒，没有 timeout、crash、Traceback 或未捕获异常。
+
+| 布局 | 得分 | 胜率 |
+|:--|--:|:--:|
+| q2_mediumClassic | 2061 | 1/1 |
+| q2_smallClassic | 1735 | 1/1 |
+| q2_mediumClassic2 | 755 | 0/1 |
+| q2_originalClassic | 3064 | 1/1 |
+| q2_trappedClassic | 532 | 1/1 |
+| q2_contestClassic | 2650 | 1/1 |
+| q2_testClassic | 524 | 1/1 |
+| q2_minimaxClassic | 513 | 1/1 |
+| q2_trickyClassic | 2457 | 1/1 |
+| q2_dangerClassic | 77 | 0/1 |
+| q2_capsuleClassic | 1262 | 1/1 |
+| q2_openClassic | 1361 | 1/1 |
+
+汇总：**10 胜、2 负，成功率 83.33%**；总分 16991，平均 1415.92。相比第一阶段提交版本，成功数从 7 增至 10，总分从 15386 增至 16991。
+
+## 10. 固定 seed 与最终多 seed 泛化
+
+### 10.1 固定 seed
+
+发布安全版的两次独立完整运行分别为9/12和官方 evaluator 10/12；稳定失败是 danger、medium2，original 会在最后少量 food 附近因墙钟 deadline 出现胜负波动。所有运行均为0 timeout、0 error。
+
+发布硬化前还运行过同一 cs188 seed 三次、共36局，得到28/36胜；该数据用于估计时钟方差，不作为发布版最终口径。
+
+### 10.2 发布安全版多 seed
+
+使用预先确定的整数 seeds 0–4，每个 seed 完整覆盖全部12图，共60局：
+
+- **37/60 胜，胜率61.67%。**
+- 平均分1161.12。
+- 0 timeout、0 error。
+
+| 布局 | 胜数/5 | 平均分 |
+|:--|--:|--:|
+| capsule | 3/5 | 795.6 |
+| contest | 4/5 | 1593.8 |
+| danger | 0/5 | 589.2 |
+| medium | 5/5 | 2162.0 |
+| medium2 | 0/5 | 1054.8 |
+| minimax | 5/5 | 513.2 |
+| open | 5/5 | 952.0 |
+| original | 1/5 | 2332.4 |
+| small | 5/5 | 1615.0 |
+| test | 5/5 | 539.6 |
+| trapped | 2/5 | -88.4 |
+| tricky | 2/5 | 1874.2 |
+
+在相同 seeds0–2 的 paired comparison 中，发布安全版从第一阶段17/36胜、均分849.75，提高到23/36胜、均分1178.42。
+
+### 10.3 优化阶段更大样本
+
+发布硬化前的最优成功率候选曾在seeds0–9、120局中得到77胜（64.17%）、均分约1165.07、0 timeout/error。之后为确保每回合先执行depth1 adversarial safety search、修正scaredTimer=1边界并扩大框架时间余量，发布版采用更保守规则；因此120局数据只作为跨10 seeds的过拟合检查，不冒充最终发布版统计。
+
+## 11. 最终限制
+
+- danger 和 medium2 在 10 seeds 中仍没有清图，是当前最明确瓶颈。
+- 搜索使用墙钟 deadline；相同 RNG seed 在不同负载下可能完成不同迭代深度，因此分数和 original 残局存在波动。
+- 走廊/cycle fallback 优先成功率，个别 open 轨迹虽然胜利但路径较长、score 较低。
+- 所有规则只读取公开 GameState 信息和模拟器稳定机制，不读取 RNG 状态，不使用布局名、坐标或 seed 特判。
