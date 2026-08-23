@@ -1,0 +1,10 @@
+[project]
+name = "qmj-grid"
+version = "0.1.0"
+description = "qmj-grid 项目"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
